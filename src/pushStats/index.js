@@ -13,7 +13,6 @@ import ApiFunc from './apiFunctions.js';
 
 const app = express();
 const port = 10004;
-let lastUpload = new Date().getTime();
 
 const users = JSON.parse(fs.readFileSync('users.json'));
 dotenv.config();
@@ -54,176 +53,147 @@ const cronLogger = createLogger({
 });
 
 class ManageStats {
-  groupedStats;
+  statsUsername;
+  user;
+  shardIndex;
+  perTickStatsInfo;
 
-  message;
+  constructor(user) {
+    this.user = user;
+    this.statsUsername = (user.prefix ? `${user.prefix}.` : '') + user.username;
+    this.shardIndex = 0;
+    this.perTickStatsInfo = {};
+    for (let shard of user.shards) {
+      this.perTickStatsInfo[shard] = {
+        prevLastTick: undefined,
+        prevLastTickTime: undefined,
+        lastTick: undefined,
+        lastTickTime: undefined
+      }
+    }
+  }
 
-  constructor() {
-    this.groupedStats = {};
+  async handleUser() {
     this.message = '----------------------------------------------------------------\r\n';
+
+    const { user } = this;
+    
+    const shard = user.shards[this.shardIndex];
+    this.shardIndex = (this.shardIndex + 1) % user.shards.length;
+
+    await this.getLoginInfo();
+    const stats = user.segment === undefined
+      ? await ApiFunc.getMemory(user, shard)
+      : await ApiFunc.getSegmentMemory(user, shard);
+    
+    const processedStats = this.processStats(shard, stats);
+
+    for (let statsEntry of processedStats) {
+      const reportStatsResult = await ManageStats.reportStats(statsEntry.data, statsEntry.timestamp);
+      if (!reportStatsResult) {
+        console.log(`Error while pushing stats. timestamp = ${statsEntry.timestamp}`);
+      }
+      else {
+        this.message += `Pushed ${user.type} stats from shard ${shard} to graphite. timestamp = ${statsEntry.timestamp}\r\n`;
+      }
+    }
+
+    if (processedStats.length > 0) {
+      logger.info(this.message);
+      console.log(this.message);
+    }
+    else {
+      this.message += 'Pushed no stats to graphite';
+      logger.info(this.message);
+      console.log(this.message);
+    }
   }
 
-  async handleUsers(type) {
-    const beginningOfMinute = new Date().getSeconds() < 15;
-    const getStatsFunctions = [];
-    users.forEach((user) => {
-      try {
-        const rightMinuteForShard = new Date().getMinutes() % user.shards.length === 0;
-        const shouldContinue = !beginningOfMinute || !rightMinuteForShard;
-        if (user.type === 'mmo' && shouldContinue) return;
-        if (user.type === 'season' && shouldContinue) return;
-        for (let y = 0; y < user.shards.length; y += 1) {
-          const shard = user.shards[y];
-          getStatsFunctions.push(this.getStats(user, shard, this.message));
+  async getLoginInfo() {
+    const { user } = this;
+    if (user.type === 'private') {
+      user.token = await ApiFunc.getPrivateServerToken(user);
+    }
+    return user.token;
+  }
+
+  processStats(shard, stats) {
+    if (Object.keys(stats).length === 0)
+      return [];
+
+    const { user } = this;
+    if (user.petTickData) {
+      const perTickStatsInfo = this.perTickStatsInfo[shard];
+      perTickStatsInfo.prevLastTick = perTickStatsInfo.lastTick;
+      perTickStatsInfo.prevLastTickTime = perTickStatsInfo.lastTickTime;
+      perTickStatsInfo.lastTick = Object.keys(stats).map(key => parseInt(key.replace('"', ''))).reduce((a, b) => a > b ? a : b)
+      perTickStatsInfo.lastTickTime = Date.now();
+
+      const tickDiff = perTickStatsInfo.lastTick - perTickStatsInfo.prevLastTick;
+      const tickTimeDiff = perTickStatsInfo.lastTickTime - perTickStatsInfo.prevLastTickTime;
+      const perTickTimeDiff = tickTimeDiff / tickDiff;
+
+      if (!perTickStatsInfo.prevLastTick || !perTickStatsInfo.lastTick)
+        return [];
+
+      let result = [];
+      for (let i = 0; i < tickDiff; ++i) {
+        const tick = perTickStatsInfo.prevLastTick + i;
+        const time = Math.ceil(perTickStatsInfo.prevLastTickTime + i * perTickTimeDiff);
+        const tickStats = stats[tick];
+        if (tickStats) {
+          result.push({
+            timestamp: time,
+            data: {
+              [this.statsUsername]: {
+                [shard]: tickStats
+              }
+            }
+          });
         }
-      } catch (error) {
-        logger.error(error.message);
       }
-    });
-    await Promise.all(getStatsFunctions);
-
-    const { groupedStats } = this;
-
-    if (type === 'mmo') {
-      if (Object.keys(groupedStats).length > 0) {
-        if (!await ManageStats.reportStats({ stats: groupedStats })) return console.log('Error while pushing stats');
-        this.message += `Pushed ${type} stats to graphite`;
-        logger.info(this.message);
-        return console.log(this.message);
-      }
-      if (beginningOfMinute) return console.log('No stats to push');
-      return undefined;
+      return result;
     }
-    if (type === 'season') {
-      if (Object.keys(groupedStats).length > 0) {
-        if (!await ManageStats.reportStats({ stats: groupedStats })) return console.log('Error while pushing stats');
-        this.message += `Pushed ${type} stats to graphite`;
-        logger.info(this.message);
-        return console.log(this.message);
-      }
-      if (beginningOfMinute) return console.log('No stats to push');
-      return undefined;
-    }
-
-    const privateUser = users.find((user) => user.type === 'private' && user.host);
-    const host = privateUser ? privateUser.host : undefined;
-    const serverStats = await ApiFunc.getServerStats(host);
-    const adminUtilsServerStats = await ApiFunc.getAdminUtilsServerStats(host);
-    if (adminUtilsServerStats) {
-      try {
-        const groupedAdminStatsUsers = {};
-        adminUtilsServerStats.users.forEach((user) => {
-          groupedAdminStatsUsers[user.username] = user;
-        });
-        adminUtilsServerStats.users = groupedAdminStatsUsers;
-      } catch (error) {
-        console.log(error);
-      }
-    }
-
-    if (!await ManageStats.reportStats({ stats: groupedStats, serverStats, adminUtilsServerStats })) return console.log('Error while pushing stats');
-    let statsPushed = '';
-    if (Object.keys(groupedStats).length > 0) {
-      statsPushed = `Pushed ${type} stats`;
-    }
-    if (serverStats) {
-      statsPushed += statsPushed.length > 0 ? ', server stats' : 'Pushed server stats';
-    }
-    if (adminUtilsServerStats) {
-      statsPushed += statsPushed.length > 0 ? ', adminUtilsServerStats' : 'Pushed server stats';
-    }
-    this.message += statsPushed.length > 0 ? `> ${statsPushed} to graphite` : '> Pushed no stats to graphite';
-    logger.info(this.message);
-    return console.log(this.message);
-  }
-
-  static async getLoginInfo(userinfo) {
-    if (userinfo.type === 'private') {
-      userinfo.token = await ApiFunc.getPrivateServerToken(userinfo);
-    }
-    return userinfo.token;
-  }
-
-  static async addLeaderboardData(userinfo) {
-    try {
-      const leaderboard = await ApiFunc.getLeaderboard(userinfo);
-      if (!leaderboard) return { rank: 0, score: 0 };
-      const leaderboardList = leaderboard.list;
-      if (leaderboardList.length === 0) return { rank: 0, score: 0 };
-      const { rank, score } = leaderboardList.slice(-1)[0];
-      return { rank, score };
-    } catch (error) {
-      return { rank: 0, score: 0 };
+    else {
+      return [{
+        timestamp: Date.now(),
+        data: {
+          [this.statsUsername]: {
+            [shard]: stats
+          }
+        }
+      }];
     }
   }
 
-  async getStats(userinfo, shard) {
-    try {
-      await ManageStats.getLoginInfo(userinfo);
-      const stats = userinfo.segment === undefined
-        ? await ApiFunc.getMemory(userinfo, shard)
-        : await ApiFunc.getSegmentMemory(userinfo, shard);
-      await this.processStats(userinfo, shard, stats);
-      return 'success';
-    } catch (error) {
-      return error;
-    }
-  }
-
-  async processStats(userinfo, shard, stats) {
-    if (Object.keys(stats).length === 0) return;
-    const me = await ApiFunc.getUserinfo(userinfo);
-    if (me) stats.power = me.power || 0;
-    stats.leaderboard = await ManageStats.addLeaderboardData(userinfo);
-    this.pushStats(userinfo, stats, shard);
-  }
-
-  static async reportStats(stats) {
+  static async reportStats(stats, timestamp) {
     return new Promise((resolve) => {
-      client.write({ [`${process.env.PREFIX ? `${process.env.PREFIX}.` : ''}screeps`]: stats }, (err) => {
-        if (err) {
-          console.log(err);
-          logger.error(err);
-          resolve(false);
+      client.write(
+        {
+          [`${process.env.PREFIX ? `${process.env.PREFIX}.` : ''}screeps`]: stats
+        },
+        timestamp,
+        (err) => {
+          if (err) {
+            console.log(err);
+            logger.error(err);
+            resolve(false);
+          }
+          else {
+            resolve(true);
+          }
         }
-        lastUpload = new Date().getTime();
-        resolve(true);
-      });
+      );
     });
-  }
-
-  pushStats(userinfo, stats, shard) {
-    if (Object.keys(stats).length === 0) return;
-    this.groupedStats[(userinfo.prefix ? `${userinfo.prefix}.` : '') + userinfo.username] = userinfo.type === 'mmo' ? { [shard]: stats } : { shard: stats };
-    this.message += `${userinfo.type}: Added stats object for ${userinfo.username} in ${shard}\r\n`;
   }
 }
 
-const groupedUsers = users.reduce((group, user) => {
-  const { type } = user;
-  // eslint-disable-next-line no-param-reassign
-  group[type] = group[type] ?? [];
-  group[type].push(user);
-  return group;
-}, {});
-
-cron.schedule('*/30 * * * * *', async () => {
-  const message = `Cron event hit: ${new Date()}`;
-  console.log(`\r\n${message}`);
-  cronLogger.info(message);
-  Object.keys(groupedUsers).forEach((type) => {
-    new ManageStats(groupedUsers[type]).handleUsers(type);
-  });
-});
-
-if (process.env.INCLUDE_PUSH_STATUS_API === 'true') {
-  app.listen(port, () => {
-    console.log(`App listening at http://localhost:${port}`);
-  });
-  app.get('/', (req, res) => {
-    const diffCompleteMinutes = Math.ceil(
-      Math.abs(parseInt(new Date().getTime(), 10) - parseInt(lastUpload, 10)) / (1000 * 60),
-    );
-    res.json({ result: diffCompleteMinutes < 300, lastUpload, diffCompleteMinutes });
+for (let user of users) {
+  const userStatsGetter = new ManageStats(user);
+  cron.schedule('*/10 * * * * *', async () => {
+    const message = `Cron event hit: ${new Date()}`;
+    console.log(`\r\n${message}`);
+    cronLogger.info(message);
+    userStatsGetter.handleUser();
   });
 }
