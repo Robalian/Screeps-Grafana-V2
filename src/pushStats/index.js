@@ -120,50 +120,69 @@ class ManageStats {
   processStats(shard, stats) {
     if (Object.keys(stats).length === 0)
       return [];
-
+      
     const { user } = this;
-    if (user.petTickData) {
-      const perTickStatsInfo = this.perTickStatsInfo[shard];
-      perTickStatsInfo.prevLastTick = perTickStatsInfo.lastTick;
-      perTickStatsInfo.prevLastTickTime = perTickStatsInfo.lastTickTime;
-      perTickStatsInfo.lastTick = Object.keys(stats).map(key => parseInt(key.replace('"', ''))).reduce((a, b) => a > b ? a : b)
-      perTickStatsInfo.lastTickTime = Date.now();
 
-      const tickDiff = perTickStatsInfo.lastTick - perTickStatsInfo.prevLastTick;
-      const tickTimeDiff = perTickStatsInfo.lastTickTime - perTickStatsInfo.prevLastTickTime;
-      const perTickTimeDiff = tickTimeDiff / tickDiff;
+    const now = Date.now();
 
-      if (!perTickStatsInfo.prevLastTick || !perTickStatsInfo.lastTick)
-        return [];
-
-      let result = [];
-      for (let i = 0; i < tickDiff; ++i) {
-        const tick = perTickStatsInfo.prevLastTick + i;
-        const time = Math.ceil(perTickStatsInfo.prevLastTickTime + i * perTickTimeDiff);
-        const tickStats = stats[tick];
-        if (tickStats) {
-          result.push({
-            timestamp: time,
-            data: {
-              [this.statsUsername]: {
-                [shard]: tickStats
-              }
-            }
-          });
+    let regularStats = {};
+    let result = [{
+      timestamp: now,
+      data: {
+        [this.statsUsername]: {
+          [shard]: regularStats
         }
       }
-      return result;
-    }
-    else {
-      return [{
-        timestamp: Date.now(),
-        data: {
-          [this.statsUsername]: {
-            [shard]: stats
+    }];
+
+    console.log(shard, user.perTickProperty);
+    for (let key in stats) {
+      if (key !== user.perTickProperty) {
+        console.log('regular:', key);
+        regularStats[key] = stats[key];
+      }
+      else {
+        console.log('per tick:', key);
+        const perTickStats = stats[key];
+
+        const perTickStatsInfo = this.perTickStatsInfo[shard];
+        perTickStatsInfo.prevLastTick = perTickStatsInfo.lastTick;
+        perTickStatsInfo.prevLastTickTime = perTickStatsInfo.lastTickTime;
+        perTickStatsInfo.prevPerTickStats = perTickStatsInfo.perTickStats;
+        perTickStatsInfo.lastTick = Object.keys(perTickStats).map(key => parseInt(key.replace('"', ''))).reduce((a, b) => a > b ? a : b)
+        perTickStatsInfo.lastTickTime = now;
+        perTickStatsInfo.perTickStats = perTickStats;
+  
+        const tickDiff = perTickStatsInfo.lastTick - perTickStatsInfo.prevLastTick;
+        const tickTimeDiff = perTickStatsInfo.lastTickTime - perTickStatsInfo.prevLastTickTime;
+        const perTickTimeDiff = tickTimeDiff / tickDiff;
+  
+        if (!perTickStatsInfo.prevLastTick || !perTickStatsInfo.lastTick)
+          continue;
+  
+        for (let i = 0; i < tickDiff; ++i) {
+          const tick = perTickStatsInfo.prevLastTick + i;
+          const time = Math.ceil(perTickStatsInfo.prevLastTickTime + i * perTickTimeDiff);
+          const tickStats = perTickStats[tick]
+            ? perTickStats[tick]
+            : perTickStatsInfo.prevPerTickStats[tick];
+          if (tickStats) {
+            result.push({
+              timestamp: time,
+              data: {
+                [this.statsUsername]: {
+                  [shard]: {
+                    tick: tick,
+                    ...tickStats
+                  }
+                }
+              }
+            });
           }
         }
-      }];
+      }
     }
+    return result;
   }
 
   static async reportStats(stats, timestamp) {
